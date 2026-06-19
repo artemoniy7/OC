@@ -28,6 +28,11 @@ public:
         byte(static_cast<std::uint8_t>((value >> 8) & 0xFF));
     }
 
+    void dword(std::uint32_t value) {
+        word(static_cast<std::uint16_t>(value & 0xFFFF));
+        word(static_cast<std::uint16_t>((value >> 16) & 0xFFFF));
+    }
+
     void bytes(std::initializer_list<std::uint8_t> values) {
         code_.insert(code_.end(), values.begin(), values.end());
     }
@@ -54,6 +59,18 @@ public:
         byte(0xE9);
         add_fixup(std::move(label), FixupKind::Rel16);
         word(0x0000);
+    }
+
+    void jump_short(std::string label) {
+        byte(0xEB);
+        add_fixup(std::move(label), FixupKind::Rel8);
+        byte(0x00);
+    }
+
+    void jump_if_zero_short(std::string label) {
+        byte(0x74);
+        add_fixup(std::move(label), FixupKind::Rel8);
+        byte(0x00);
     }
 
     void jump_if_equal(std::string label) {
@@ -133,13 +150,37 @@ public:
         word(0x0000);
     }
 
+    void lgdt(std::string label) {
+        bytes({0x0F, 0x01, 0x16});
+        add_fixup(std::move(label), FixupKind::Abs16);
+        word(0x0000);
+    }
+
+    void far_jump(std::uint16_t selector, std::string label) {
+        byte(0xEA);
+        add_fixup(std::move(label), FixupKind::Abs16);
+        word(0x0000);
+        word(selector);
+    }
+
+    void mov_esi_abs32(std::string label) {
+        byte(0xBE);
+        add_fixup(std::move(label), FixupKind::Abs32);
+        dword(0x00000000);
+    }
+
+    void dword_abs(std::string label) {
+        add_fixup(std::move(label), FixupKind::Abs32);
+        dword(0x00000000);
+    }
+
     std::vector<std::uint8_t> finish() {
         resolve_fixups();
         return code_;
     }
 
 private:
-    enum class FixupKind { Abs16, Rel16 };
+    enum class FixupKind { Abs16, Abs32, Rel8, Rel16 };
 
     struct Fixup {
         std::size_t offset;
@@ -156,6 +197,11 @@ private:
         code_.at(offset + 1) = static_cast<std::uint8_t>((value >> 8) & 0xFF);
     }
 
+    void patch_dword(std::size_t offset, std::uint32_t value) {
+        patch_word(offset, static_cast<std::uint16_t>(value & 0xFFFF));
+        patch_word(offset + 2, static_cast<std::uint16_t>((value >> 16) & 0xFFFF));
+    }
+
     void resolve_fixups() {
         for (const auto& fixup : fixups_) {
             const auto label = labels_.find(fixup.label);
@@ -168,9 +214,21 @@ private:
                 patch_word(fixup.offset, static_cast<std::uint16_t>(origin_ + target));
                 continue;
             }
+            if (fixup.kind == FixupKind::Abs32) {
+                patch_dword(fixup.offset, static_cast<std::uint32_t>(origin_ + target));
+                continue;
+            }
 
-            const auto next_instruction = fixup.offset + 2;
+            const auto width = fixup.kind == FixupKind::Rel8 ? 1 : 2;
+            const auto next_instruction = fixup.offset + width;
             const auto relative = static_cast<std::int32_t>(target) - static_cast<std::int32_t>(next_instruction);
+            if (fixup.kind == FixupKind::Rel8) {
+                if (relative < -128 || relative > 127) {
+                    throw std::runtime_error("short jump is out of range");
+                }
+                code_.at(fixup.offset) = static_cast<std::uint8_t>(static_cast<std::int8_t>(relative));
+                continue;
+            }
             if (relative < -32768 || relative > 32767) {
                 throw std::runtime_error("relative jump is out of range");
             }
@@ -273,6 +331,7 @@ std::vector<std::uint8_t> make_kernel() {
         {'E', "echo_mode"}, {'B', "beep"}, {'M', "show_memory"}, {'K', "show_keyboard"},
         {'D', "show_disk"}, {'T', "show_tasks"}, {'V', "show_video"}, {'S', "show_syscalls"},
         {'N', "show_notes"}, {'P', "show_processes"}, {'F', "cycle_color"}, {'G', "position_demo"},
+        {'X', "enter_protected_mode"},
     };
     for (const auto& [key, label] : commands) {
         kernel.bytes({0x3C, static_cast<std::uint8_t>(key)});
@@ -330,6 +389,51 @@ std::vector<std::uint8_t> make_kernel() {
     kernel.mov_si("position_text");
     kernel.call("print_string");
     kernel.jump("main_loop");
+
+    kernel.label("enter_protected_mode");
+    kernel.call("clear_screen");
+    kernel.mov_si("pmode_text");
+    kernel.call("print_string");
+    kernel.bytes({0xFA});                         // cli
+    kernel.lgdt("gdt_descriptor");
+    kernel.bytes({
+        0x0F, 0x20, 0xC0,             // mov eax, cr0
+        0x66, 0x83, 0xC8, 0x01,       // or eax, 1
+        0x0F, 0x22, 0xC0              // mov cr0, eax
+    });
+    kernel.far_jump(0x0008, "pm32_entry");
+
+    kernel.label("pm32_entry");
+    kernel.bytes({
+        0xB8, 0x10, 0x00, 0x00, 0x00, // mov eax, 0x10
+        0x8E, 0xD8,                   // mov ds, ax
+        0x8E, 0xC0,                   // mov es, ax
+        0x8E, 0xE0,                   // mov fs, ax
+        0x8E, 0xE8,                   // mov gs, ax
+        0x8E, 0xD0,                   // mov ss, ax
+        0xBC, 0x00, 0x00, 0x09, 0x00, // mov esp, 0x90000
+        0xBF, 0x00, 0x80, 0x0B, 0x00  // mov edi, 0xB8000
+    });
+    kernel.mov_esi_abs32("pm32_message");
+    kernel.label("pm32_loop");
+    kernel.bytes({0xAC, 0x84, 0xC0});             // lodsb; test al, al
+    kernel.jump_if_zero_short("pm32_halt");
+    kernel.bytes({0xB4, 0x0A, 0x66, 0xAB});       // mov ah, 0x0A; stosw
+    kernel.jump_short("pm32_loop");
+    kernel.label("pm32_halt");
+    kernel.bytes({0xF4});                         // hlt
+    kernel.jump_short("pm32_halt");
+
+    kernel.label("gdt");
+    kernel.dword(0x00000000);
+    kernel.dword(0x00000000);
+    kernel.dword(0x0000FFFF);
+    kernel.dword(0x00CF9A00);
+    kernel.dword(0x0000FFFF);
+    kernel.dword(0x00CF9200);
+    kernel.label("gdt_descriptor");
+    kernel.word(24 - 1);
+    kernel.dword_abs("gdt");
 
     kernel.label("beep");
     kernel.bytes({0xB0, 0x07, 0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10});
@@ -477,7 +581,7 @@ std::vector<std::uint8_t> make_kernel() {
         "H help A about C home R reboot\r\n"
         "E echo B beep M memory K keyboard\r\n"
         "D disk T tasks V video S syscalls\r\n"
-        "N notes P processes F color G goto\r\n\r\n"
+        "N notes P processes F color G goto X pmode\r\n\r\n"
         "Press a key...\r\n");
 
     kernel.label("help_text");
@@ -491,6 +595,7 @@ std::vector<std::uint8_t> make_kernel() {
         "B: terminal bell\r\n"
         "F: cycle text color\r\n"
         "G: positioned text demo\r\n"
+        "X: enter protected mode demo\r\n"
         "M/K/D/T/V/S/N/P: kernel info panels\r\n");
 
     kernel.label("about_text");
@@ -537,6 +642,15 @@ std::vector<std::uint8_t> make_kernel() {
         "Backspace erases echoed text.\r\n"
         "Screen scrolls and hardware cursor moves.\r\n"
         "F cycles color, G positions text.\r\n");
+
+    kernel.label("pmode_text");
+    kernel.text(
+        "Entering protected mode...\r\n"
+        "The shell will stop after the switch.\r\n");
+
+    kernel.label("pm32_message");
+    kernel.text(
+        "OC protected mode: 32-bit code is running.");
 
     kernel.label("color_text");
     kernel.text(
