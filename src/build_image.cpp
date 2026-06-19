@@ -12,12 +12,15 @@
 #include <vector>
 
 namespace {
-constexpr std::size_t kBootSectorSize = 512;
+constexpr std::size_t kSectorSize = 512;
 constexpr std::size_t kBootSignatureOffset = 510;
-constexpr std::uint16_t kBiosLoadAddress = 0x7C00;
+constexpr std::uint16_t kBootLoadAddress = 0x7C00;
+constexpr std::uint16_t kKernelLoadAddress = 0x8000;
 
-class BootAssembler {
+class Assembler {
 public:
+    explicit Assembler(std::uint16_t origin) : origin_(origin) {}
+
     void byte(std::uint8_t value) { code_.push_back(value); }
 
     void word(std::uint16_t value) {
@@ -59,24 +62,27 @@ public:
         word(0x0000);
     }
 
+    void jump_if_carry(std::string label) {
+        bytes({0x0F, 0x82});
+        add_fixup(std::move(label), FixupKind::Rel16);
+        word(0x0000);
+    }
+
     void mov_si(std::string label) {
         byte(0xBE);
         add_fixup(std::move(label), FixupKind::Abs16);
         word(0x0000);
     }
 
-    std::array<std::uint8_t, kBootSectorSize> finish() {
+    void mov_mem8_dl(std::string label) {
+        bytes({0x88, 0x16});
+        add_fixup(std::move(label), FixupKind::Abs16);
+        word(0x0000);
+    }
+
+    std::vector<std::uint8_t> finish() {
         resolve_fixups();
-
-        if (code_.size() > kBootSignatureOffset) {
-            throw std::runtime_error("boot sector code is too large: " + std::to_string(code_.size()) + " bytes");
-        }
-
-        std::array<std::uint8_t, kBootSectorSize> sector{};
-        std::copy(code_.begin(), code_.end(), sector.begin());
-        sector[kBootSignatureOffset] = 0x55;
-        sector[kBootSignatureOffset + 1] = 0xAA;
-        return sector;
+        return code_;
     }
 
 private:
@@ -106,7 +112,7 @@ private:
 
             const auto target = label->second;
             if (fixup.kind == FixupKind::Abs16) {
-                patch_word(fixup.offset, static_cast<std::uint16_t>(kBiosLoadAddress + target));
+                patch_word(fixup.offset, static_cast<std::uint16_t>(origin_ + target));
                 continue;
             }
 
@@ -119,15 +125,25 @@ private:
         }
     }
 
+    std::uint16_t origin_;
     std::vector<std::uint8_t> code_;
     std::unordered_map<std::string, std::size_t> labels_;
     std::vector<Fixup> fixups_;
 };
 
-std::array<std::uint8_t, kBootSectorSize> make_boot_sector() {
-    BootAssembler boot;
+void append_sector_padding(std::vector<std::uint8_t>& bytes) {
+    const auto remainder = bytes.size() % kSectorSize;
+    if (remainder != 0) {
+        bytes.resize(bytes.size() + (kSectorSize - remainder), 0x00);
+    }
+}
 
-    // 16-bit x86 code loaded by BIOS at 0000:7C00.
+std::array<std::uint8_t, kSectorSize> make_boot_sector(std::uint8_t kernel_sector_count) {
+    if (kernel_sector_count == 0) {
+        throw std::runtime_error("kernel must occupy at least one sector");
+    }
+
+    Assembler boot(kBootLoadAddress);
     boot.bytes({
         0xFA,                         // cli
         0x31, 0xC0,                   // xor ax, ax
@@ -137,114 +153,242 @@ std::array<std::uint8_t, kBootSectorSize> make_boot_sector() {
         0xBC, 0x00, 0x7C,             // mov sp, 0x7C00
         0xFB,                         // sti
     });
-    boot.jump("draw_home");
+    boot.mov_mem8_dl("boot_drive");
+    boot.mov_si("boot_drive");
+    boot.bytes({
+        0xBB, 0x00, 0x80,             // mov bx, 0x8000
+        0xB4, 0x02,                   // mov ah, 0x02 (read sectors)
+        0xB0, kernel_sector_count,    // mov al, kernel_sector_count
+        0xB5, 0x00,                   // mov ch, 0 (cylinder)
+        0xB1, 0x02,                   // mov cl, 2 (first sector after boot sector)
+        0xB6, 0x00,                   // mov dh, 0 (head)
+        0x8A, 0x14,                   // mov dl, [si]
+        0xCD, 0x13                    // int 0x13
+    });
+    boot.jump_if_carry("disk_error");
+    boot.bytes({0xEA, 0x00, 0x80, 0x00, 0x00});   // jmp 0000:8000
 
-    boot.label("main_loop");
-    boot.bytes({0x31, 0xC0, 0xCD, 0x16});         // xor ax, ax; int 0x16 (wait key)
-    boot.bytes({0x24, 0xDF});                     // and al, 0xDF (normalize ASCII letters to uppercase)
-    boot.bytes({0x3C, static_cast<std::uint8_t>('H')});
-    boot.jump_if_equal("show_help");
-    boot.bytes({0x3C, static_cast<std::uint8_t>('A')});
-    boot.jump_if_equal("show_about");
-    boot.bytes({0x3C, static_cast<std::uint8_t>('C')});
-    boot.jump_if_equal("draw_home");
-    boot.bytes({0x3C, static_cast<std::uint8_t>('R')});
-    boot.jump_if_equal("reboot");
-    boot.bytes({0x3C, static_cast<std::uint8_t>('E')});
-    boot.jump_if_equal("echo_mode");
-    boot.bytes({0x3C, static_cast<std::uint8_t>('B')});
-    boot.jump_if_equal("beep");
-    boot.bytes({0x3C, static_cast<std::uint8_t>('M')});
-    boot.jump_if_equal("show_memory");
-    boot.jump("main_loop");
-
-    boot.label("draw_home");
-    boot.call("clear_screen");
-    boot.mov_si("home_text");
+    boot.label("disk_error");
+    boot.mov_si("error_text");
     boot.call("print_string");
-    boot.jump("main_loop");
-
-    boot.label("show_help");
-    boot.call("clear_screen");
-    boot.mov_si("help_text");
-    boot.call("print_string");
-    boot.jump("main_loop");
-
-    boot.label("show_about");
-    boot.call("clear_screen");
-    boot.mov_si("about_text");
-    boot.call("print_string");
-    boot.jump("main_loop");
-
-    boot.label("show_memory");
-    boot.call("clear_screen");
-    boot.mov_si("memory_text");
-    boot.call("print_string");
-    boot.jump("main_loop");
-
-    boot.label("beep");
-    boot.bytes({0xB0, 0x07, 0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10}); // print BEL
-    boot.jump("main_loop");
-
-    boot.label("echo_mode");
-    boot.call("clear_screen");
-    boot.mov_si("echo_text");
-    boot.call("print_string");
-    boot.label("echo_loop");
-    boot.bytes({0x31, 0xC0, 0xCD, 0x16});         // wait key
-    boot.bytes({0x3C, 0x1B});                     // Esc exits
-    boot.jump_if_equal("draw_home");
-    boot.bytes({0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10});
-    boot.jump("echo_loop");
-
-    boot.label("reboot");
-    boot.bytes({0xCD, 0x19});                         // int 0x19 (bootstrap loader)
-    boot.jump("reboot");
-
-    boot.label("clear_screen");
-    boot.bytes({0xB8, 0x03, 0x00, 0xCD, 0x10, 0xC3}); // mov ax, 0x0003; int 0x10; ret
+    boot.bytes({0xCD, 0x16, 0xCD, 0x19});         // wait for key; reboot
 
     boot.label("print_string");
-    boot.bytes({0xAC});                               // lodsb
-    boot.bytes({0x3C, 0x00});                         // cmp al, 0
+    boot.bytes({0xAC, 0x3C, 0x00});               // lodsb; cmp al, 0
     boot.jump_if_equal("print_done");
-    boot.bytes({0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10}); // BIOS teletype, page 0, light gray
+    boot.bytes({0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10});
     boot.jump("print_string");
     boot.label("print_done");
-    boot.bytes({0xC3});                               // ret
+    boot.bytes({0xC3});
 
-    boot.label("home_text");
-    boot.text(
-        "OC mini shell\r\n"
-        "------------\r\n"
+    boot.label("boot_drive");
+    boot.byte(0x00);
+    boot.label("error_text");
+    boot.text("OC boot: disk read error. Press key.\r\n");
+
+    auto bytes = boot.finish();
+    if (bytes.size() > kBootSignatureOffset) {
+        throw std::runtime_error("boot sector code is too large: " + std::to_string(bytes.size()) + " bytes");
+    }
+
+    std::array<std::uint8_t, kSectorSize> sector{};
+    std::copy(bytes.begin(), bytes.end(), sector.begin());
+    sector[kBootSignatureOffset] = 0x55;
+    sector[kBootSignatureOffset + 1] = 0xAA;
+    return sector;
+}
+
+std::vector<std::uint8_t> make_kernel() {
+    Assembler kernel(kKernelLoadAddress);
+
+    kernel.bytes({
+        0xFA,                         // cli
+        0x31, 0xC0,                   // xor ax, ax
+        0x8E, 0xD8,                   // mov ds, ax
+        0x8E, 0xC0,                   // mov es, ax
+        0x8E, 0xD0,                   // mov ss, ax
+        0xBC, 0x00, 0x80,             // mov sp, 0x8000
+        0xFB,                         // sti
+    });
+    kernel.jump("draw_home");
+
+    kernel.label("main_loop");
+    kernel.bytes({0x31, 0xC0, 0xCD, 0x16});       // wait key
+    kernel.bytes({0x24, 0xDF});                   // uppercase ASCII letter
+    const std::vector<std::pair<char, std::string>> commands = {
+        {'H', "show_help"}, {'A', "show_about"}, {'C', "draw_home"}, {'R', "reboot"},
+        {'E', "echo_mode"}, {'B', "beep"}, {'M', "show_memory"}, {'K', "show_keyboard"},
+        {'D', "show_disk"}, {'T', "show_tasks"}, {'V', "show_video"}, {'S', "show_syscalls"},
+        {'N', "show_notes"}, {'P', "show_processes"},
+    };
+    for (const auto& [key, label] : commands) {
+        kernel.bytes({0x3C, static_cast<std::uint8_t>(key)});
+        kernel.jump_if_equal(label);
+    }
+    kernel.jump("main_loop");
+
+    auto screen = [&kernel](std::string_view label, std::string_view text_label) {
+        kernel.label(std::string(label));
+        kernel.call("clear_screen");
+        kernel.mov_si(std::string(text_label));
+        kernel.call("print_string");
+        kernel.jump("main_loop");
+    };
+
+    kernel.label("draw_home");
+    kernel.call("clear_screen");
+    kernel.mov_si("home_text");
+    kernel.call("print_string");
+    kernel.jump("main_loop");
+
+    screen("show_help", "help_text");
+    screen("show_about", "about_text");
+    screen("show_memory", "memory_text");
+    screen("show_keyboard", "keyboard_text");
+    screen("show_disk", "disk_text");
+    screen("show_tasks", "tasks_text");
+    screen("show_video", "video_text");
+    screen("show_syscalls", "syscalls_text");
+    screen("show_notes", "notes_text");
+    screen("show_processes", "processes_text");
+
+    kernel.label("beep");
+    kernel.bytes({0xB0, 0x07, 0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10});
+    kernel.jump("main_loop");
+
+    kernel.label("echo_mode");
+    kernel.call("clear_screen");
+    kernel.mov_si("echo_text");
+    kernel.call("print_string");
+    kernel.label("echo_loop");
+    kernel.bytes({0x31, 0xC0, 0xCD, 0x16});       // wait key
+    kernel.bytes({0x3C, 0x1B});                   // Esc exits
+    kernel.jump_if_equal("draw_home");
+    kernel.bytes({0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10});
+    kernel.jump("echo_loop");
+
+    kernel.label("reboot");
+    kernel.bytes({0xCD, 0x19});
+    kernel.jump("reboot");
+
+    kernel.label("clear_screen");
+    kernel.bytes({0xB8, 0x03, 0x00, 0xCD, 0x10, 0xC3});
+
+    kernel.label("print_string");
+    kernel.bytes({0xAC, 0x3C, 0x00});             // lodsb; cmp al, 0
+    kernel.jump_if_equal("print_done");
+    kernel.bytes({0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10});
+    kernel.jump("print_string");
+    kernel.label("print_done");
+    kernel.bytes({0xC3});
+
+    kernel.label("home_text");
+    kernel.text(
+        "OC kernel shell\r\n"
+        "===============\r\n"
         "H help A about C home R reboot\r\n"
-        "E echo B beep M mem\r\n\r\n"
+        "E echo B beep M memory K keyboard\r\n"
+        "D disk T tasks V video S syscalls\r\n"
+        "N notes P processes\r\n\r\n"
         "Press a key...\r\n");
 
-    boot.label("help_text");
-    boot.text(
+    kernel.label("help_text");
+    kernel.text(
         "Help\r\n"
-        "H help A about C home R reboot\r\n"
-        "E echo until Esc B beep\r\n"
-        "M memory notes\r\n");
+        "H: this help\r\n"
+        "A: kernel info\r\n"
+        "C: redraw desktop\r\n"
+        "R: BIOS reboot\r\n"
+        "E: echo typed keys until Esc\r\n"
+        "B: terminal bell\r\n"
+        "M/K/D/T/V/S/N/P: kernel info panels\r\n");
 
-    boot.label("about_text");
-    boot.text(
-        "About OC\r\n"
-        "Tiny BIOS OS starter.\r\n"
-        "Richer boot shell in 512 bytes.\r\n");
+    kernel.label("about_text");
+    kernel.text(
+        "About OC kernel\r\n"
+        "Boot sector loads this kernel from disk.\r\n"
+        "Kernel lives at 0000:8000 and owns the shell.\r\n"
+        "Still real mode, but no longer only boot code.\r\n");
 
-    boot.label("memory_text");
-    boot.text(
-        "Memory\r\n"
-        "Stack 0000:7C00\r\n"
-        "Text VRAM B800\r\n");
+    kernel.label("memory_text");
+    kernel.text(
+        "Memory map v0\r\n"
+        "Boot sector: 0000:7C00\r\n"
+        "Kernel:      0000:8000\r\n"
+        "Stack:       grows below 8000\r\n"
+        "Text VRAM:   B800:0000\r\n");
 
-    boot.label("echo_text");
-    boot.text(
-        "Echo: type, Esc=menu\r\n\r\n");
+    kernel.label("keyboard_text");
+    kernel.text(
+        "Keyboard driver v0\r\n"
+        "BIOS int 16h waits for a key.\r\n"
+        "ASCII commands are case-insensitive.\r\n"
+        "Echo mode returns with Esc.\r\n");
 
-    return boot.finish();
+    kernel.label("disk_text");
+    kernel.text(
+        "Disk loader v0\r\n"
+        "Boot uses BIOS int 13h.\r\n"
+        "It reads kernel sectors starting at sector 2.\r\n"
+        "This image now has bootloader + kernel.\r\n");
+
+    kernel.label("tasks_text");
+    kernel.text(
+        "Task manager stub\r\n"
+        "PID 0: idle shell\r\n"
+        "PID 1: keyboard loop\r\n"
+        "Next: timer IRQ and scheduler.\r\n");
+
+    kernel.label("video_text");
+    kernel.text(
+        "Video console v0\r\n"
+        "Mode: BIOS text 80x25\r\n"
+        "Output: int 10h teletype\r\n"
+        "Next: write directly to B800 memory.\r\n");
+
+    kernel.label("syscalls_text");
+    kernel.text(
+        "Syscall plan\r\n"
+        "0 print string\r\n"
+        "1 read key\r\n"
+        "2 clear screen\r\n"
+        "Next: software interrupt API.\r\n");
+
+    kernel.label("echo_text");
+    kernel.text(
+        "Echo mode\r\n"
+        "Type anything; Esc returns to the kernel menu.\r\n\r\n");
+
+    kernel.label("notes_text");
+    kernel.text(
+        "Kernel notes\r\n"
+        "Separate kernel means more than 512 bytes.\r\n"
+        "Next milestones: protected mode, C++ kernel, drivers.\r\n");
+
+    kernel.label("processes_text");
+    kernel.text(
+        "Processes v0\r\n"
+        "No isolation yet.\r\n"
+        "Shell is the first userspace-like task.\r\n"
+        "Next: process table in RAM.\r\n");
+
+    auto bytes = kernel.finish();
+    append_sector_padding(bytes);
+    return bytes;
+}
+
+std::vector<std::uint8_t> make_image() {
+    auto kernel = make_kernel();
+    const auto kernel_sector_count = kernel.size() / kSectorSize;
+    if (kernel_sector_count > 127) {
+        throw std::runtime_error("kernel is too large for one BIOS read");
+    }
+
+    const auto boot = make_boot_sector(static_cast<std::uint8_t>(kernel_sector_count));
+    std::vector<std::uint8_t> image;
+    image.insert(image.end(), boot.begin(), boot.end());
+    image.insert(image.end(), kernel.begin(), kernel.end());
+    return image;
 }
 
 void write_image(const std::filesystem::path& path) {
@@ -252,13 +396,13 @@ void write_image(const std::filesystem::path& path) {
         std::filesystem::create_directories(path.parent_path());
     }
 
-    const auto sector = make_boot_sector();
+    const auto image_bytes = make_image();
     std::ofstream image(path, std::ios::binary);
     if (!image) {
         throw std::runtime_error("cannot open output image");
     }
 
-    image.write(reinterpret_cast<const char*>(sector.data()), sector.size());
+    image.write(reinterpret_cast<const char*>(image_bytes.data()), static_cast<std::streamsize>(image_bytes.size()));
     if (!image) {
         throw std::runtime_error("cannot write output image");
     }
