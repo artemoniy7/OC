@@ -115,6 +115,24 @@ public:
         word(0x0000);
     }
 
+    void mov_al_mem8(std::string label) {
+        byte(0xA0);
+        add_fixup(std::move(label), FixupKind::Abs16);
+        word(0x0000);
+    }
+
+    void mov_ah_mem8(std::string label) {
+        bytes({0x8A, 0x26});
+        add_fixup(std::move(label), FixupKind::Abs16);
+        word(0x0000);
+    }
+
+    void mov_mem8_al(std::string label) {
+        byte(0xA2);
+        add_fixup(std::move(label), FixupKind::Abs16);
+        word(0x0000);
+    }
+
     std::vector<std::uint8_t> finish() {
         resolve_fixups();
         return code_;
@@ -254,7 +272,7 @@ std::vector<std::uint8_t> make_kernel() {
         {'H', "show_help"}, {'A', "show_about"}, {'C', "draw_home"}, {'R', "reboot"},
         {'E', "echo_mode"}, {'B', "beep"}, {'M', "show_memory"}, {'K', "show_keyboard"},
         {'D', "show_disk"}, {'T', "show_tasks"}, {'V', "show_video"}, {'S', "show_syscalls"},
-        {'N', "show_notes"}, {'P', "show_processes"},
+        {'N', "show_notes"}, {'P', "show_processes"}, {'F', "cycle_color"}, {'G', "position_demo"},
     };
     for (const auto& [key, label] : commands) {
         kernel.bytes({0x3C, static_cast<std::uint8_t>(key)});
@@ -286,6 +304,32 @@ std::vector<std::uint8_t> make_kernel() {
     screen("show_syscalls", "syscalls_text");
     screen("show_notes", "notes_text");
     screen("show_processes", "processes_text");
+
+    kernel.label("cycle_color");
+    kernel.mov_al_mem8("text_attr");
+    kernel.bytes({
+        0xFE, 0xC0,                   // inc al
+        0x24, 0x0F,                   // and al, 0x0F
+        0x3C, 0x00                    // cmp al, 0
+    });
+    kernel.jump_if_equal("color_nonzero");
+    kernel.jump("store_color");
+    kernel.label("color_nonzero");
+    kernel.bytes({0xB0, 0x01});       // mov al, 1
+    kernel.label("store_color");
+    kernel.mov_mem8_al("text_attr");
+    kernel.call("clear_screen");
+    kernel.mov_si("color_text");
+    kernel.call("print_string");
+    kernel.jump("main_loop");
+
+    kernel.label("position_demo");
+    kernel.call("clear_screen");
+    kernel.mov_mem16_imm("cursor_pos", 0x07B2);   // row 12, column 25
+    kernel.call("normalize_cursor");
+    kernel.mov_si("position_text");
+    kernel.call("print_string");
+    kernel.jump("main_loop");
 
     kernel.label("beep");
     kernel.bytes({0xB0, 0x07, 0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10});
@@ -341,7 +385,8 @@ std::vector<std::uint8_t> make_kernel() {
     kernel.bytes({0x50, 0x53, 0x57, 0x06});       // push ax; push bx; push di; push es
     kernel.bytes({0xBB, 0x00, 0xB8, 0x8E, 0xC3}); // mov bx, 0xB800; mov es, bx
     kernel.mov_di_mem16("cursor_pos");
-    kernel.bytes({0xB4, 0x07, 0xAB});             // mov ah, 0x07; stosw
+    kernel.mov_ah_mem8("text_attr");
+    kernel.bytes({0xAB});                         // stosw
     kernel.mov_mem16_di("cursor_pos");
     kernel.call("normalize_cursor");
     kernel.bytes({0x07, 0x5F, 0x5B, 0x58});       // pop es; pop di; pop bx; pop ax
@@ -380,6 +425,8 @@ std::vector<std::uint8_t> make_kernel() {
 
     kernel.label("cursor_pos");
     kernel.word(0x0000);
+    kernel.label("text_attr");
+    kernel.byte(0x07);
 
     kernel.label("normalize_cursor");
     kernel.bytes({0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x1E, 0x06}); // push ax,bx,cx,dx,si,di,ds,es
@@ -430,7 +477,7 @@ std::vector<std::uint8_t> make_kernel() {
         "H help A about C home R reboot\r\n"
         "E echo B beep M memory K keyboard\r\n"
         "D disk T tasks V video S syscalls\r\n"
-        "N notes P processes\r\n\r\n"
+        "N notes P processes F color G goto\r\n\r\n"
         "Press a key...\r\n");
 
     kernel.label("help_text");
@@ -442,6 +489,8 @@ std::vector<std::uint8_t> make_kernel() {
         "R: BIOS reboot\r\n"
         "E: echo typed keys until Esc\r\n"
         "B: terminal bell\r\n"
+        "F: cycle text color\r\n"
+        "G: positioned text demo\r\n"
         "M/K/D/T/V/S/N/P: kernel info panels\r\n");
 
     kernel.label("about_text");
@@ -486,7 +535,20 @@ std::vector<std::uint8_t> make_kernel() {
         "Mode: BIOS text 80x25\r\n"
         "Output: direct writes to B800 memory.\r\n"
         "Backspace erases echoed text.\r\n"
-        "Screen scrolls and hardware cursor moves.\r\n");
+        "Screen scrolls and hardware cursor moves.\r\n"
+        "F cycles color, G positions text.\r\n");
+
+    kernel.label("color_text");
+    kernel.text(
+        "Color changed\r\n"
+        "New text uses the next VGA foreground color.\r\n"
+        "Press F again to keep cycling.\r\n");
+
+    kernel.label("position_text");
+    kernel.text(
+        "Positioned text demo\r\n"
+        "This message starts near the middle of the screen.\r\n"
+        "Direct VRAM output can place text anywhere.\r\n");
 
     kernel.label("syscalls_text");
     kernel.text(
