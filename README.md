@@ -1,4 +1,4 @@
-# OC — самый первый шаг к своей ОС
+# DOC — самый первый шаг к своей ОС
 
 Это учебный старт собственной ОС: C++ программа собирает загрузочный BIOS-образ (`build/os.img`) без NASM/GRUB/кросс-компилятора. Образ можно запустить в QEMU из UCRT64.
 
@@ -29,11 +29,6 @@ qemu-system-i386 -drive format=raw,file=build/os.img
 
 ```text
 OC kernel shell
-===============
-H help A about C home R reboot
-E echo B beep M memory K keyboard
-D disk T tasks V video S syscalls
-N notes P processes F color G goto
 
 Press a key...
 ```
