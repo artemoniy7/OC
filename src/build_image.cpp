@@ -80,6 +80,37 @@ public:
         word(0x0000);
     }
 
+    void mov_mem16_imm(std::string label, std::uint16_t value) {
+        bytes({0xC7, 0x06});
+        add_fixup(std::move(label), FixupKind::Abs16);
+        word(0x0000);
+        word(value);
+    }
+
+    void mov_di_mem16(std::string label) {
+        bytes({0x8B, 0x3E});
+        add_fixup(std::move(label), FixupKind::Abs16);
+        word(0x0000);
+    }
+
+    void mov_ax_mem16(std::string label) {
+        byte(0xA1);
+        add_fixup(std::move(label), FixupKind::Abs16);
+        word(0x0000);
+    }
+
+    void mov_mem16_di(std::string label) {
+        bytes({0x89, 0x3E});
+        add_fixup(std::move(label), FixupKind::Abs16);
+        word(0x0000);
+    }
+
+    void add_mem16_bx(std::string label) {
+        bytes({0x01, 0x1E});
+        add_fixup(std::move(label), FixupKind::Abs16);
+        word(0x0000);
+    }
+
     std::vector<std::uint8_t> finish() {
         resolve_fixups();
         return code_;
@@ -264,7 +295,7 @@ std::vector<std::uint8_t> make_kernel() {
     kernel.bytes({0x31, 0xC0, 0xCD, 0x16});       // wait key
     kernel.bytes({0x3C, 0x1B});                   // Esc exits
     kernel.jump_if_equal("draw_home");
-    kernel.bytes({0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10});
+    kernel.call("print_char");
     kernel.jump("echo_loop");
 
     kernel.label("reboot");
@@ -272,15 +303,75 @@ std::vector<std::uint8_t> make_kernel() {
     kernel.jump("reboot");
 
     kernel.label("clear_screen");
-    kernel.bytes({0xB8, 0x03, 0x00, 0xCD, 0x10, 0xC3});
+    kernel.bytes({
+        0x50,                         // push ax
+        0x51,                         // push cx
+        0x57,                         // push di
+        0x06,                         // push es
+        0xB8, 0x00, 0xB8,             // mov ax, 0xB800
+        0x8E, 0xC0,                   // mov es, ax
+        0x31, 0xFF,                   // xor di, di
+        0xB8, 0x20, 0x07,             // mov ax, 0x0720
+        0xB9, 0xD0, 0x07,             // mov cx, 2000
+        0xF3, 0xAB                    // rep stosw
+    });
+    kernel.mov_mem16_imm("cursor_pos", 0x0000);
+    kernel.bytes({0x07, 0x5F, 0x59, 0x58, 0xC3}); // pop es; pop di; pop cx; pop ax; ret
 
     kernel.label("print_string");
     kernel.bytes({0xAC, 0x3C, 0x00});             // lodsb; cmp al, 0
     kernel.jump_if_equal("print_done");
-    kernel.bytes({0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10});
+    kernel.call("print_char");
     kernel.jump("print_string");
     kernel.label("print_done");
     kernel.bytes({0xC3});
+
+    kernel.label("print_char");
+    kernel.bytes({0x3C, 0x0D});                   // cmp al, CR
+    kernel.jump_if_equal("char_done");
+    kernel.bytes({0x3C, 0x0A});                   // cmp al, LF
+    kernel.jump_if_equal("newline");
+    kernel.bytes({0x3C, 0x08});                   // cmp al, Backspace
+    kernel.jump_if_equal("backspace");
+    kernel.bytes({0x50, 0x53, 0x57, 0x06});       // push ax; push bx; push di; push es
+    kernel.bytes({0xBB, 0x00, 0xB8, 0x8E, 0xC3}); // mov bx, 0xB800; mov es, bx
+    kernel.mov_di_mem16("cursor_pos");
+    kernel.bytes({0xB4, 0x07, 0xAB});             // mov ah, 0x07; stosw
+    kernel.mov_mem16_di("cursor_pos");
+    kernel.bytes({0x07, 0x5F, 0x5B, 0x58});       // pop es; pop di; pop bx; pop ax
+    kernel.label("char_done");
+    kernel.bytes({0xC3});
+
+    kernel.label("newline");
+    kernel.bytes({0x50, 0x53, 0x52});             // push ax; push bx; push dx
+    kernel.mov_ax_mem16("cursor_pos");
+    kernel.bytes({
+        0x31, 0xD2,                   // xor dx, dx
+        0xBB, 0xA0, 0x00,             // mov bx, 160
+        0xF7, 0xF3,                   // div bx
+        0x29, 0xD3                    // sub bx, dx
+    });
+    kernel.add_mem16_bx("cursor_pos");
+    kernel.bytes({0x5A, 0x5B, 0x58, 0xC3});       // pop dx; pop bx; pop ax; ret
+
+    kernel.label("backspace");
+    kernel.bytes({0x50, 0x57, 0x06});             // push ax; push di; push es
+    kernel.mov_di_mem16("cursor_pos");
+    kernel.bytes({0x81, 0xFF, 0x00, 0x00});       // cmp di, 0
+    kernel.jump_if_equal("backspace_done");
+    kernel.bytes({0x83, 0xEF, 0x02});             // sub di, 2
+    kernel.mov_mem16_di("cursor_pos");
+    kernel.bytes({
+        0xB8, 0x00, 0xB8,             // mov ax, 0xB800
+        0x8E, 0xC0,                   // mov es, ax
+        0xB8, 0x20, 0x07,             // mov ax, 0x0720
+        0xAB                          // stosw
+    });
+    kernel.label("backspace_done");
+    kernel.bytes({0x07, 0x5F, 0x58, 0xC3});       // pop es; pop di; pop ax; ret
+
+    kernel.label("cursor_pos");
+    kernel.word(0x0000);
 
     kernel.label("home_text");
     kernel.text(
@@ -343,8 +434,8 @@ std::vector<std::uint8_t> make_kernel() {
     kernel.text(
         "Video console v0\r\n"
         "Mode: BIOS text 80x25\r\n"
-        "Output: int 10h teletype\r\n"
-        "Next: write directly to B800 memory.\r\n");
+        "Output: direct writes to B800 memory.\r\n"
+        "Backspace erases echoed text.\r\n");
 
     kernel.label("syscalls_text");
     kernel.text(
