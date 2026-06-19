@@ -141,22 +141,21 @@ std::array<std::uint8_t, kBootSectorSize> make_boot_sector() {
 
     boot.label("main_loop");
     boot.bytes({0x31, 0xC0, 0xCD, 0x16});         // xor ax, ax; int 0x16 (wait key)
-    boot.bytes({0x3C, static_cast<std::uint8_t>('h')});
-    boot.jump_if_equal("show_help");
+    boot.bytes({0x24, 0xDF});                     // and al, 0xDF (normalize ASCII letters to uppercase)
     boot.bytes({0x3C, static_cast<std::uint8_t>('H')});
     boot.jump_if_equal("show_help");
-    boot.bytes({0x3C, static_cast<std::uint8_t>('a')});
-    boot.jump_if_equal("show_about");
     boot.bytes({0x3C, static_cast<std::uint8_t>('A')});
     boot.jump_if_equal("show_about");
-    boot.bytes({0x3C, static_cast<std::uint8_t>('c')});
-    boot.jump_if_equal("draw_home");
     boot.bytes({0x3C, static_cast<std::uint8_t>('C')});
     boot.jump_if_equal("draw_home");
-    boot.bytes({0x3C, static_cast<std::uint8_t>('r')});
-    boot.jump_if_equal("reboot");
     boot.bytes({0x3C, static_cast<std::uint8_t>('R')});
     boot.jump_if_equal("reboot");
+    boot.bytes({0x3C, static_cast<std::uint8_t>('E')});
+    boot.jump_if_equal("echo_mode");
+    boot.bytes({0x3C, static_cast<std::uint8_t>('B')});
+    boot.jump_if_equal("beep");
+    boot.bytes({0x3C, static_cast<std::uint8_t>('M')});
+    boot.jump_if_equal("show_memory");
     boot.jump("main_loop");
 
     boot.label("draw_home");
@@ -176,6 +175,27 @@ std::array<std::uint8_t, kBootSectorSize> make_boot_sector() {
     boot.mov_si("about_text");
     boot.call("print_string");
     boot.jump("main_loop");
+
+    boot.label("show_memory");
+    boot.call("clear_screen");
+    boot.mov_si("memory_text");
+    boot.call("print_string");
+    boot.jump("main_loop");
+
+    boot.label("beep");
+    boot.bytes({0xB0, 0x07, 0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10}); // print BEL
+    boot.jump("main_loop");
+
+    boot.label("echo_mode");
+    boot.call("clear_screen");
+    boot.mov_si("echo_text");
+    boot.call("print_string");
+    boot.label("echo_loop");
+    boot.bytes({0x31, 0xC0, 0xCD, 0x16});         // wait key
+    boot.bytes({0x3C, 0x1B});                     // Esc exits
+    boot.jump_if_equal("draw_home");
+    boot.bytes({0xB4, 0x0E, 0xBB, 0x07, 0x00, 0xCD, 0x10});
+    boot.jump("echo_loop");
 
     boot.label("reboot");
     boot.bytes({0xCD, 0x19});                         // int 0x19 (bootstrap loader)
@@ -197,24 +217,32 @@ std::array<std::uint8_t, kBootSectorSize> make_boot_sector() {
     boot.text(
         "OC mini shell\r\n"
         "------------\r\n"
-        "H help  A about\r\n"
-        "C clear R reboot\r\n\r\n"
+        "H help A about C home R reboot\r\n"
+        "E echo B beep M mem\r\n\r\n"
         "Press a key...\r\n");
 
     boot.label("help_text");
     boot.text(
         "Help\r\n"
-        "H: show this screen\r\n"
-        "A: about this OS\r\n"
-        "C: clear screen\r\n"
-        "R: reboot VM\r\n");
+        "H help A about C home R reboot\r\n"
+        "E echo until Esc B beep\r\n"
+        "M memory notes\r\n");
 
     boot.label("about_text");
     boot.text(
         "About OC\r\n"
         "Tiny BIOS OS starter.\r\n"
-        "Built by C++ image builder.\r\n"
-        "Next: load a kernel.\r\n");
+        "Richer boot shell in 512 bytes.\r\n");
+
+    boot.label("memory_text");
+    boot.text(
+        "Memory\r\n"
+        "Stack 0000:7C00\r\n"
+        "Text VRAM B800\r\n");
+
+    boot.label("echo_text");
+    boot.text(
+        "Echo: type, Esc=menu\r\n\r\n");
 
     return boot.finish();
 }
