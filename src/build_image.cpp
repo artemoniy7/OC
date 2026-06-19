@@ -63,6 +63,10 @@ public:
     }
 
     void jump_if_carry(std::string label) {
+        jump_if_below(std::move(label));
+    }
+
+    void jump_if_below(std::string label) {
         bytes({0x0F, 0x82});
         add_fixup(std::move(label), FixupKind::Rel16);
         word(0x0000);
@@ -316,6 +320,7 @@ std::vector<std::uint8_t> make_kernel() {
         0xF3, 0xAB                    // rep stosw
     });
     kernel.mov_mem16_imm("cursor_pos", 0x0000);
+    kernel.call("normalize_cursor");
     kernel.bytes({0x07, 0x5F, 0x59, 0x58, 0xC3}); // pop es; pop di; pop cx; pop ax; ret
 
     kernel.label("print_string");
@@ -338,6 +343,7 @@ std::vector<std::uint8_t> make_kernel() {
     kernel.mov_di_mem16("cursor_pos");
     kernel.bytes({0xB4, 0x07, 0xAB});             // mov ah, 0x07; stosw
     kernel.mov_mem16_di("cursor_pos");
+    kernel.call("normalize_cursor");
     kernel.bytes({0x07, 0x5F, 0x5B, 0x58});       // pop es; pop di; pop bx; pop ax
     kernel.label("char_done");
     kernel.bytes({0xC3});
@@ -352,6 +358,7 @@ std::vector<std::uint8_t> make_kernel() {
         0x29, 0xD3                    // sub bx, dx
     });
     kernel.add_mem16_bx("cursor_pos");
+    kernel.call("normalize_cursor");
     kernel.bytes({0x5A, 0x5B, 0x58, 0xC3});       // pop dx; pop bx; pop ax; ret
 
     kernel.label("backspace");
@@ -367,11 +374,54 @@ std::vector<std::uint8_t> make_kernel() {
         0xB8, 0x20, 0x07,             // mov ax, 0x0720
         0xAB                          // stosw
     });
+    kernel.call("normalize_cursor");
     kernel.label("backspace_done");
     kernel.bytes({0x07, 0x5F, 0x58, 0xC3});       // pop es; pop di; pop ax; ret
 
     kernel.label("cursor_pos");
     kernel.word(0x0000);
+
+    kernel.label("normalize_cursor");
+    kernel.bytes({0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x1E, 0x06}); // push ax,bx,cx,dx,si,di,ds,es
+    kernel.mov_ax_mem16("cursor_pos");
+    kernel.bytes({0x3D, 0xA0, 0x0F});             // cmp ax, 4000
+    kernel.jump_if_below("update_hw_cursor");
+    kernel.bytes({
+        0xB8, 0x00, 0xB8,             // mov ax, 0xB800
+        0x8E, 0xD8,                   // mov ds, ax
+        0x8E, 0xC0,                   // mov es, ax
+        0xBE, 0xA0, 0x00,             // mov si, 160
+        0x31, 0xFF,                   // xor di, di
+        0xB9, 0x80, 0x07,             // mov cx, 1920
+        0xF3, 0xA5,                   // rep movsw
+        0xB8, 0x20, 0x07,             // mov ax, 0x0720
+        0xB9, 0x50, 0x00,             // mov cx, 80
+        0xF3, 0xAB,                   // rep stosw
+        0x31, 0xC0,                   // xor ax, ax
+        0x8E, 0xD8                    // mov ds, ax (restore kernel data segment for labels)
+    });
+    kernel.mov_mem16_imm("cursor_pos", 0x0F00);   // start of last text row
+
+    kernel.label("update_hw_cursor");
+    kernel.mov_ax_mem16("cursor_pos");
+    kernel.bytes({
+        0xD1, 0xE8,                   // shr ax, 1 (word offset -> cell offset)
+        0x89, 0xC3,                   // mov bx, ax
+        0xBA, 0xD4, 0x03,             // mov dx, 0x03D4
+        0xB0, 0x0F,                   // mov al, 0x0F
+        0xEE,                         // out dx, al
+        0x42,                         // inc dx
+        0x88, 0xD8,                   // mov al, bl
+        0xEE,                         // out dx, al
+        0x4A,                         // dec dx
+        0xB0, 0x0E,                   // mov al, 0x0E
+        0xEE,                         // out dx, al
+        0x42,                         // inc dx
+        0x88, 0xF8,                   // mov al, bh
+        0xEE,                         // out dx, al
+        0x07, 0x1F, 0x5F, 0x5E, 0x5A, 0x59, 0x5B, 0x58, 0xC3
+                                      // pop es,ds,di,si,dx,cx,bx,ax; ret
+    });
 
     kernel.label("home_text");
     kernel.text(
@@ -435,7 +485,8 @@ std::vector<std::uint8_t> make_kernel() {
         "Video console v0\r\n"
         "Mode: BIOS text 80x25\r\n"
         "Output: direct writes to B800 memory.\r\n"
-        "Backspace erases echoed text.\r\n");
+        "Backspace erases echoed text.\r\n"
+        "Screen scrolls and hardware cursor moves.\r\n");
 
     kernel.label("syscalls_text");
     kernel.text(
